@@ -59,7 +59,17 @@ class CTCGreedyDecoding:
             c == len(self.tokenizer) + 1
         ), f"Num classes {c} != len(vocab) + 1 {len(self.tokenizer) + 1}"
         labels = log_probs.argmax(dim=-1, keepdim=False)
-
+        # print("len labels", len(labels[0]), b)
+        # # print('labels', labels)
+        # lbls = labels[0].cpu().tolist()
+        # text = ""
+        # for i in lbls:
+        #     if i == 33:
+        #         text += "Z"
+        #     else:
+        #         text += self.tokenizer.decode([i])
+        # print("labels", text)
+        # print("\n\n")
         skip_mask = labels != self.blank_id
         skip_mask[:, 1:] = torch.logical_and(
             skip_mask[:, 1:], labels[:, 1:] != labels[:, :-1]
@@ -67,12 +77,56 @@ class CTCGreedyDecoding:
         for length in lengths:
             skip_mask[length:] = 0
 
-        pred_texts: List[str] = []
+        # for i in range(b):
+        #     pred_texts.append(
+        #         "".join(self.tokenizer.decode(labels[i][skip_mask[i]].cpu().tolist()))
+        #     )
+        # return pred_texts
+        # print('skip mask', skip_mask[0])
+        # pred_texts: List[str] = []
+        pred_ids: List[int] = []
+        word_timestamps = []
+        current_word_tokens = []
+        word_begin_ms = -1
+        word_end_ms = 0
+        lbls = labels.cpu().tolist()
         for i in range(b):
-            pred_texts.append(
-                "".join(self.tokenizer.decode(labels[i][skip_mask[i]].cpu().tolist()))
+            for idx, is_masked in enumerate(skip_mask[i]):
+                if is_masked and lbls[i][idx] != 0:
+                    if word_begin_ms == -1:
+                        word_begin_ms = idx * 40
+                    current_word_tokens.append(lbls[i][idx])
+                    # print(lbls[i][idx], self.tokenizer.decode([lbls[i][idx]]))
+                    word_end_ms = idx * 40
+                elif is_masked and lbls[i][idx] == 0:
+                    word_timestamps.append(
+                        {
+                            "word": self.tokenizer.decode(current_word_tokens),
+                            "token_ids": current_word_tokens,
+                            "start": word_begin_ms / 1000,
+                            "end": word_end_ms / 1000,
+                        }
+                    )
+                    current_word_tokens = []
+                    word_begin_ms = -1
+            pred_ids.append(labels[i][skip_mask[i]].cpu().tolist())
+            # pred_texts.append(
+            #     "".join(self.tokenizer.decode(labels[i][skip_mask[i]].cpu().tolist()))
+            # )
+        if current_word_tokens:
+            word_timestamps.append(
+                {
+                    "word": self.tokenizer.decode(current_word_tokens),
+                    "token_ids": current_word_tokens,
+                    "start": word_begin_ms / 1000,
+                    "end": word_end_ms / 1000,
+                }
             )
-        return pred_texts
+        return {
+            # "text": pred_texts,
+            "ids": pred_ids,
+            "word_timestamps": word_timestamps
+        }
 
 
 class RNNTGreedyDecoding:
