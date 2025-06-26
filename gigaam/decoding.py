@@ -85,12 +85,13 @@ class CTCGreedyDecoding:
         # print('skip mask', skip_mask[0])
         # pred_texts: List[str] = []
         pred_ids: List[int] = []
-        word_timestamps = []
+        word_timestamps_res = []
         current_word_tokens = []
         word_begin_ms = -1
         word_end_ms = 0
         lbls = labels.cpu().tolist()
         for i in range(b):
+            word_timestamps = []
             for idx, is_masked in enumerate(skip_mask[i]):
                 if is_masked and lbls[i][idx] != 0:
                     if word_begin_ms == -1:
@@ -113,19 +114,20 @@ class CTCGreedyDecoding:
             # pred_texts.append(
             #     "".join(self.tokenizer.decode(labels[i][skip_mask[i]].cpu().tolist()))
             # )
-        if current_word_tokens:
-            word_timestamps.append(
-                {
-                    "word": self.tokenizer.decode(current_word_tokens),
-                    "token_ids": current_word_tokens,
-                    "start": word_begin_ms / 1000,
-                    "end": word_end_ms / 1000,
-                }
-            )
+            if current_word_tokens:
+                word_timestamps.append(
+                    {
+                        "word": self.tokenizer.decode(current_word_tokens),
+                        "token_ids": current_word_tokens,
+                        "start": word_begin_ms / 1000,
+                        "end": word_end_ms / 1000,
+                    }
+                )
+            word_timestamps_res.append(word_timestamps)
         return {
             # "text": pred_texts,
             "ids": pred_ids,
-            "word_timestamps": word_timestamps
+            "word_timestamps": word_timestamps_res
         }
 
 

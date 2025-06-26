@@ -246,13 +246,13 @@ class GigaAMASR(GigaAM):
         chunk_len_sec: int = 20,
         overlap_len_sec: int = 4,
         sample_rate: int = 16000,
+        batch_size: int = 8,  # <-- New parameter for batch size
         **kwargs,
     ):
         """
-            Transcribes a long audio file by splitting it into overlapping chunks,
-            then intelligently merging the resulting word timestamp lists.
+            Transcribes a long audio file using batched, overlapping chunks.
         """
-        # This part remains the same
+        # 1. Chunking logic remains the same
         wav = load_audio(wav_file)
         chunk_samples = chunk_len_sec * sample_rate
         overlap_samples = overlap_len_sec * sample_rate
@@ -265,43 +265,65 @@ class GigaAMASR(GigaAM):
             chunks.append(wav[start:end])
             start += step_samples
 
-        # CHANGE: We will store the final list of word dictionaries here.
+        # --- KEY CHANGE 1: Group chunks into batches ---
+        chunk_batches = []
+        for i in range(0, len(chunks), batch_size):
+            chunk_batches.append(chunks[i:i + batch_size])
+            
+        print(f"Split audio into {len(chunks)} chunks, grouped into {len(chunk_batches)} batches of size up to {batch_size}.")
+
         final_word_timestamps = []
+        global_chunk_index = 0  # Keep track of the absolute chunk number for timestamping
 
-        for i, chunk in enumerate(chunks):
-            # Audio processing remains the same
-            wav_chunk = chunk.to(self._device).to(self._dtype).unsqueeze(0)
-            length = torch.full([1], wav_chunk.shape[-1], device=self._device)
-            encoded, encoded_len = self.forward(wav_chunk, length)
+        # 2. Main loop now iterates over BATCHES of chunks
+        for batch in chunk_batches:
+            # --- KEY CHANGE 2: Pad chunks within the batch to the same length ---
+            max_len_in_batch = max(len(c) for c in batch)
+            
+            padded_wavs = []
+            original_lengths = []
 
-            # Get the structured result from the decoder
+            for chunk in batch:
+                original_lengths.append(len(chunk))
+                # Pad the numpy array before converting to a tensor
+                padding_needed = max_len_in_batch - len(chunk)
+                padded_chunk = np.pad(chunk, (0, padding_needed), mode='constant')
+                padded_wavs.append(padded_chunk)
+
+            # Create the batch tensors for the model
+            wav_batch = torch.from_numpy(np.stack(padded_wavs)).to(self._device).to(self._dtype)
+            length_batch = torch.tensor(original_lengths, device=self._device)
+
+            # 3. Perform batched inference
+            encoded, encoded_len = self.forward(wav_batch, length_batch)
             res = self.decoding.decode(self.head, encoded, encoded_len)
             
-            # We work with the word_timestamps list now
-            new_words = res['word_timestamps'] # Assuming decode returns a batch
+            # `res` contains results for the whole batch. 
+            # `res["word_timestamps"]` is now a list of lists.
+            batch_of_word_lists = res["word_timestamps"]
+            # print(batch_of_word_lists)
 
-            # --- KEY CHANGE 1: Timestamp Correction ---
-            # Calculate the time offset of the current chunk in seconds.
-            time_offset_sec = (i * step_samples) / sample_rate
+            # --- KEY CHANGE 3: Process results of the batch sequentially ---
+            # This inner loop handles the logic for each chunk from the batch result
+            for i, new_words in enumerate(batch_of_word_lists):
+                
+                # Timestamp Correction: Use the global index
+                current_chunk_idx = global_chunk_index + i
+                time_offset_sec = (current_chunk_idx * step_samples) / sample_rate
+
+                for word in new_words:
+                    word["start"] = round(word["start"] + time_offset_sec, 2)
+                    word["end"] = round(word["end"] + time_offset_sec, 2)
+
+                # print(f"--- Chunk {current_chunk_idx + 1}: Found {len(new_words)} words (time offset: {time_offset_sec:.2f}s) ---")
+                
+                # Merging: The merge function is called sequentially for each result in the batch
+                final_word_timestamps = _merge_word_timestamps(final_word_timestamps, new_words)
             
-            # Apply the offset to make timestamps absolute.
-            for word in new_words:
-                word['start'] += time_offset_sec
-                word['end'] += time_offset_sec
-                # Round for cleaner output, optional
-                word['start'] = round(word['start'], 2)
-                word['end'] = round(word['end'], 2)
+            # Update the global index to the start of the next batch
+            global_chunk_index += len(batch)
 
-            print(f"--- Chunk {i+1}: Found {len(new_words)} words (time offset: {time_offset_sec:.2f}s) ---")
-            # For debugging, you can print the words from this chunk:
-            # print([w['word'] for w in new_words])
 
-            # --- KEY CHANGE 2: Merging Word Lists ---
-            # Use our new helper function to merge the word lists.
-            final_word_timestamps = _merge_word_timestamps(final_word_timestamps, new_words)
-
-        # The final result is the merged list of word dictionaries.
-        # You can return this directly or format it as a string.
         return final_word_timestamps
 
 
