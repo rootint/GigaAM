@@ -239,7 +239,75 @@ class GigaAMASR(GigaAM):
 
     ### --- CUSTOM IMPLEMENTATION --- ###
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
+    # def transcribe_longform_overlap(
+    #     self,
+    #     wav_file: str,
+    #     chunk_len_sec: int = 20,
+    #     overlap_len_sec: int = 4,
+    #     sample_rate: int = 16000,
+    #     **kwargs,
+    # ):
+    #     """
+    #     Transcribes a long audio file by splitting it into overlapping chunks,
+    #     then intelligently merging the resulting word timestamp lists.
+    #     """
+    #     # This part remains the same
+    #     wav = load_audio(wav_file)
+    #     chunk_samples = chunk_len_sec * sample_rate
+    #     overlap_samples = overlap_len_sec * sample_rate
+    #     step_samples = chunk_samples - overlap_samples
+
+    #     chunks = []
+    #     start = 0
+    #     while start < len(wav):
+    #         end = start + chunk_samples
+    #         chunks.append(wav[start:end])
+    #         start += step_samples
+
+    #     # CHANGE: We will store the final list of word dictionaries here.
+    #     final_word_timestamps = []
+
+    #     for i, chunk in enumerate(chunks):
+    #         # Audio processing remains the same
+    #         wav_chunk = chunk.to(self._device).to(self._dtype).unsqueeze(0)
+    #         length = torch.full([1], wav_chunk.shape[-1], device=self._device)
+    #         encoded, encoded_len = self.forward(wav_chunk, length)
+
+    #         # Get the structured result from the decoder
+    #         res = self.decoding.decode(self.head, encoded, encoded_len)
+
+    #         # We work with the word_timestamps list now
+    #         new_words = res["word_timestamps"]  # Assuming decode returns a batch
+
+    #         # --- KEY CHANGE 1: Timestamp Correction ---
+    #         # Calculate the time offset of the current chunk in seconds.
+    #         time_offset_sec = (i * step_samples) / sample_rate
+
+    #         # Apply the offset to make timestamps absolute.
+    #         for word in new_words:
+    #             word["start"] += time_offset_sec
+    #             word["end"] += time_offset_sec
+    #             # Round for cleaner output, optional
+    #             word["start"] = round(word["start"], 2)
+    #             word["end"] = round(word["end"], 2)
+
+    #         print(
+    #             f"--- Chunk {i+1}: Found {len(new_words)} words (time offset: {time_offset_sec:.2f}s) ---"
+    #         )
+    #         # For debugging, you can print the words from this chunk:
+    #         # print([w['word'] for w in new_words])
+
+    #         # --- KEY CHANGE 2: Merging Word Lists ---
+    #         # Use our new helper function to merge the word lists.
+    #         final_word_timestamps = _merge_word_timestamps(
+    #             final_word_timestamps, new_words
+    #         )
+
+    #     # The final result is the merged list of word dictionaries.
+    #     # You can return this directly or format it as a string.
+    #     return final_word_timestamps
+
     def transcribe_longform_overlap(
         self,
         wav_file: str,
@@ -249,10 +317,9 @@ class GigaAMASR(GigaAM):
         **kwargs,
     ):
         """
-            Transcribes a long audio file by splitting it into overlapping chunks,
-            then intelligently merging the resulting word timestamp lists.
+        Implements the full long-form transcription pipeline using a
+        fault-tolerant merging strategy inspired by Hugging Face's implementation.
         """
-        # This part remains the same
         wav = load_audio(wav_file)
         chunk_samples = chunk_len_sec * sample_rate
         overlap_samples = overlap_len_sec * sample_rate
@@ -265,44 +332,55 @@ class GigaAMASR(GigaAM):
             chunks.append(wav[start:end])
             start += step_samples
 
-        # CHANGE: We will store the final list of word dictionaries here.
-        final_word_timestamps = []
+        final_sequence = []
 
         for i, chunk in enumerate(chunks):
-            # Audio processing remains the same
             wav_chunk = chunk.to(self._device).to(self._dtype).unsqueeze(0)
             length = torch.full([1], wav_chunk.shape[-1], device=self._device)
             encoded, encoded_len = self.forward(wav_chunk, length)
 
             # Get the structured result from the decoder
             res = self.decoding.decode(self.head, encoded, encoded_len)
-            
-            # We work with the word_timestamps list now
-            new_words = res['word_timestamps'] # Assuming decode returns a batch
 
-            # --- KEY CHANGE 1: Timestamp Correction ---
-            # Calculate the time offset of the current chunk in seconds.
-            time_offset_sec = (i * step_samples) / sample_rate
-            
-            # Apply the offset to make timestamps absolute.
-            for word in new_words:
-                word['start'] += time_offset_sec
-                word['end'] += time_offset_sec
-                # Round for cleaner output, optional
-                word['start'] = round(word['start'], 2)
-                word['end'] = round(word['end'], 2)
+            new_sequence = res['ids'][0]
+            new_words = res['word_time']
 
-            print(f"--- Chunk {i+1}: Found {len(new_words)} words (time offset: {time_offset_sec:.2f}s) ---")
-            # For debugging, you can print the words from this chunk:
-            # print([w['word'] for w in new_words])
+            # 5) Merge the tokens using the fault-tolerant algorithm
+            if not final_sequence:
+                final_sequence = new_sequence
+            else:
+                # This block implements the Hugging Face merge logic
+                best_overlap_index = 0
+                max_matching_score = 0.0
 
-            # --- KEY CHANGE 2: Merging Word Lists ---
-            # Use our new helper function to merge the word lists.
-            final_word_timestamps = _merge_word_timestamps(final_word_timestamps, new_words)
+                # We check every possible overlap length `k`
+                for k in range(1, min(len(final_sequence), len(new_sequence)) + 1):
+                    # Suffix of the previous sequence
+                    prev_suffix = final_sequence[-k:]
+                    # Prefix of the new sequence
+                    new_prefix = new_sequence[:k]
 
-        # The final result is the merged list of word dictionaries.
-        # You can return this directly or format it as a string.
-        return final_word_timestamps
+                    # Count how many tokens match
+                    matches = np.sum(np.array(prev_suffix) == np.array(new_prefix))
+
+                    # Calculate the matching score with an epsilon for tie-breaking
+                    epsilon = k / 10000.0
+                    matching_score = matches / k + epsilon
+
+                    # If this is the best score so far, store it
+                    # We add `matches > 1` as a heuristic to avoid spurious single-token matches
+                    if matches > 1 and matching_score > max_matching_score:
+                        max_matching_score = matching_score
+                        best_overlap_index = k
+
+                if best_overlap_index > 0:
+                    # Append the part of the new tokens that comes *after* the overlap
+                    final_sequence.extend(new_sequence[best_overlap_index:])
+                else:
+                    # print("No significant overlap found. Appending all new tokens.")
+                    final_sequence.extend(new_sequence)
+
+        return self.decoding.tokenizer.decode(final_sequence)
 
 
 class GigaAMEmo(GigaAM):
