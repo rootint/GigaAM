@@ -99,6 +99,7 @@ class CTCGreedyDecoding:
                     # print(lbls[i][idx], self.tokenizer.decode([lbls[i][idx]]))
                     word_end_ms = idx * 40
                 elif is_masked and lbls[i][idx] == 0:
+                    current_word_tokens.append(lbls[i][idx])
                     word_timestamps.append(
                         {
                             "word": self.tokenizer.decode(current_word_tokens),
@@ -122,10 +123,17 @@ class CTCGreedyDecoding:
                     "end": word_end_ms / 1000,
                 }
             )
+        # print(pred_ids[0])
+        # print([token_id for i in word_timestamps for token_id in (i["token_ids"])])
+        # print(
+        #     "checking",
+        #     pred_ids[0]
+        #     == [token_id for i in word_timestamps for token_id in (i["token_ids"])],
+        # )
         return {
             # "text": pred_texts,
             "ids": pred_ids,
-            "word_timestamps": word_timestamps
+            "word_timestamps": word_timestamps,
         }
 
 
