@@ -13,67 +13,6 @@ import numpy as np
 LONGFORM_THRESHOLD = 25 * SAMPLE_RATE
 
 
-def _merge_word_timestamps(
-    prev_words: List[Dict[str, Any]], new_words: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Merges two lists of word timestamp dictionaries, correcting the end
-    timestamp of the boundary word to prevent losing spaces.
-    """
-    if not prev_words:
-        return new_words
-    if not new_words:
-        return prev_words
-
-    prev_word_tokens = [word["token_ids"] for word in prev_words]
-    new_word_tokens = [word["token_ids"] for word in new_words]
-
-    # The logic to find the best overlap remains the same
-    best_overlap_n_words = 0
-    max_matching_score = 0.0
-
-    for k in range(1, min(len(prev_word_tokens), len(new_word_tokens)) + 1):
-        prev_suffix = prev_word_tokens[-k:]
-        new_prefix = new_word_tokens[:k]
-        flat_prev = [tok for word in prev_suffix for tok in word]
-        flat_new = [tok for word in new_prefix for tok in word]
-
-        compare_len = min(len(flat_prev), len(flat_new))
-        if compare_len == 0:
-            continue
-
-        matches = np.sum(
-            np.array(flat_prev[:compare_len]) == np.array(flat_new[:compare_len])
-        )
-        matching_score = matches / compare_len + (k / 1000.0)
-
-        if matching_score > max_matching_score:
-            max_matching_score = matching_score
-            best_overlap_n_words = k
-
-    if max_matching_score < 0.5:
-        best_overlap_n_words = 0
-
-    # --- THIS IS THE KEY FIX ---
-    if best_overlap_n_words > 0:
-        # 1. Update the end timestamp of the last word in the previous list.
-        # This word is at index -1 of prev_words.
-        # Its corresponding, more accurate version is the last word in the overlapping
-        # part of new_words, which is at index `best_overlap_n_words - 1`.
-        last_word_to_update = prev_words[-1]
-        corrected_word = new_words[best_overlap_n_words - 1]
-        last_word_to_update["end"] = corrected_word["end"]
-
-        # 2. Append the non-overlapping words from the new list.
-        # The non-overlapping part starts from index `best_overlap_n_words`.
-        merged = prev_words + new_words[best_overlap_n_words:]
-    else:
-        # If no overlap, just append everything.
-        merged = prev_words + new_words
-
-    return merged
-
-
 class GigaAM(nn.Module):
     """
     Giga Acoustic Model: Self-Supervised Model for Speech Tasks
@@ -318,17 +257,28 @@ class GigaAMASR(GigaAM):
         chunk_len_sec: int = 20,
         overlap_len_sec: int = 4,
         sample_rate: int = 16000,
+        batch_size: int = 8,  # New parameter for batching
         **kwargs,
     ):
         """
         Implements the full long-form transcription pipeline using a
-        fault-tolerant merging strategy inspired by Hugging Face's implementation.
+        fault-tolerant merging strategy with batched inference.
+
+        Args:
+            wav_file (str): Path to the audio file.
+            chunk_len_sec (int): Length of each audio chunk in seconds.
+            overlap_len_sec (int): Length of the overlap between consecutive chunks in seconds.
+            sample_rate (int): The sample rate of the audio.
+            batch_size (int): Number of chunks to process simultaneously.
+            **kwargs: Additional arguments.
         """
         wav = load_audio(wav_file)
         chunk_samples = chunk_len_sec * sample_rate
         overlap_samples = overlap_len_sec * sample_rate
         step_samples = chunk_samples - overlap_samples
+        step_sec = step_samples / sample_rate
 
+        # 1) Split audio into overlapping chunks
         chunks = []
         start = 0
         while start < len(wav):
@@ -337,85 +287,106 @@ class GigaAMASR(GigaAM):
             start += step_samples
 
         final_sequence = []
-        final_words = {}
+        final_words = []
 
-        for i, chunk in enumerate(chunks):
-            wav_chunk = chunk.to(self._device).to(self._dtype).unsqueeze(0)
-            length = torch.full([1], wav_chunk.shape[-1], device=self._device)
-            encoded, encoded_len = self.forward(wav_chunk, length)
+        # 2) Process chunks in batches
+        for i in range(0, len(chunks), batch_size):
+            batch_of_chunks = chunks[i : i + batch_size]
 
-            # Get the structured result from the decoder
+            # --- Create batch tensors for the model ---
+            original_lengths = [len(c) for c in batch_of_chunks]
+            max_len = max(original_lengths)
+
+            # Pad all chunks in the batch to the same length
+            padded_chunks = [
+                torch.nn.functional.pad(c, (0, max_len - len(c))) for c in batch_of_chunks
+            ]
+            
+            wav_batch = torch.stack(padded_chunks).to(self._device).to(self._dtype)
+            length_batch = torch.tensor(original_lengths, device=self._device)
+
+            # --- Perform batched inference ---
+            encoded, encoded_len = self.forward(wav_batch, length_batch)
             res = self.decoding.decode(self.head, encoded, encoded_len)
 
-            new_sequence = res["ids"][0]
-            new_words = res["word_timestamps"]
-            for word in new_words:
-                word['start'] += i * 16
-                word['end'] += i * 16
+            # --- De-batch results and stitch them sequentially ---
+            # The `res` dictionary contains lists of results for each item in the batch
+            batch_sequences = res["ids"]
+            batch_word_timestamps = res["word_timestamps"]
 
-            # 5) Merge the tokens using the fault-tolerant algorithm
-            if not final_sequence:
-                final_sequence = new_sequence
-                final_words = new_words
-            else:
-                # This block implements the Hugging Face merge logic
-                best_overlap_index = 0
-                max_matching_score = 0.0
+            for j in range(len(batch_of_chunks)):
+                # Get the result for the j-th chunk in the current batch
+                new_sequence = batch_sequences[j]
+                new_words = batch_word_timestamps[j]
+                global_chunk_idx = i + j
 
-                # We check every possible overlap length `k`
-                for k in range(1, min(len(final_sequence), len(new_sequence)) + 1):
-                    # Suffix of the previous sequence
-                    prev_suffix = final_sequence[-k:]
-                    # Prefix of the new sequence
-                    new_prefix = new_sequence[:k]
+                # Correct timestamps by adding the chunk's start time in the full audio
+                offset_sec = global_chunk_idx * step_sec
+                for word in new_words:
+                    word['start'] += offset_sec
+                    word['end'] += offset_sec
+                
+                # 5) Merge the tokens using the fault-tolerant algorithm
+                if not final_sequence:
+                    final_sequence = new_sequence
+                    final_words = new_words
+                else:
+                    best_overlap_index = 0
+                    max_matching_score = 0.0
 
-                    # Count how many tokens match
-                    matches = np.sum(np.array(prev_suffix) == np.array(new_prefix))
+                    # Check every possible overlap length `k`
+                    for k in range(1, min(len(final_sequence), len(new_sequence)) + 1):
+                        prev_suffix = final_sequence[-k:]
+                        new_prefix = new_sequence[:k]
 
-                    # Calculate the matching score with an epsilon for tie-breaking
-                    epsilon = k / 10000.0
-                    matching_score = matches / k + epsilon
+                        matches = np.sum(np.array(prev_suffix) == np.array(new_prefix))
+                        epsilon = k / 10000.0
+                        matching_score = matches / k + epsilon
 
-                    # If this is the best score so far, store it
-                    # We add `matches > 1` as a heuristic to avoid spurious single-token matches
-                    if matches > 1 and matching_score > max_matching_score:
-                        max_matching_score = matching_score
-                        best_overlap_index = k
+                        if matches > 1 and matching_score > max_matching_score:
+                            max_matching_score = matching_score
+                            best_overlap_index = k
 
-                if best_overlap_index > 0:
                     # Append the part of the new tokens that comes *after* the overlap
                     final_sequence.extend(new_sequence[best_overlap_index:])
-                    # last_start = final_words[-1]["start"]
-                    current_word_idx = 0
-                    i = 0
-                    while True:
-                        if (
-                            i + len(new_words[current_word_idx]["token_ids"])
-                            > best_overlap_index
-                        ):
-                            break
-                        i += len(new_words[current_word_idx]["token_ids"])
-                        current_word_idx += 1
-                    new_end = new_words[current_word_idx]["end"]
-                    new_start = new_words[current_word_idx]["start"]
-                    new_ids = new_sequence[
-                        best_overlap_index : i
-                        + len(new_words[current_word_idx]["token_ids"])
-                    ]
-                    new_words[current_word_idx] = {
-                        "start": new_start,
-                        "end": new_end,
-                        "word": self.decoding.tokenizer.decode(new_ids),
-                        "token_ids": new_ids,
-                    }
 
-                    final_words.extend(new_words[current_word_idx:])
+                    if best_overlap_index > 0:
+                        # Find the first word in `new_words` that is not fully in the overlapped part
+                        tokens_processed = 0
+                        word_idx_to_start_from = 0
+                        
+                        for idx, word_data in enumerate(new_words):
+                            tokens_in_word = len(word_data["token_ids"])
+                            # If the overlap boundary is within this word
+                            if tokens_processed + tokens_in_word > best_overlap_index:
+                                word_idx_to_start_from = idx
+                                
+                                # Check if the split is exactly at the word boundary
+                                if tokens_processed == best_overlap_index:
+                                    # The split is clean, we start from this word
+                                    pass 
+                                else:
+                                    # The word is split. We need to trim the tokens from the beginning of it.
+                                    tokens_to_trim = best_overlap_index - tokens_processed
+                                    remaining_ids = word_data["token_ids"][tokens_to_trim:]
+                                    
+                                    if remaining_ids:
+                                        # Update the split word with remaining tokens and re-decoded text
+                                        new_words[idx]["token_ids"] = remaining_ids
+                                        new_words[idx]["word"] = self.decoding.tokenizer.decode(remaining_ids)
+                                    else:
+                                        # The word was fully consumed by the overlap, start from the next one
+                                        word_idx_to_start_from = idx + 1
+                                break
+                            
+                            tokens_processed += tokens_in_word
+                        
+                        if word_idx_to_start_from < len(new_words):
+                            final_words.extend(new_words[word_idx_to_start_from:])
+                    else:
+                        # No good overlap found, append everything
+                        final_words.extend(new_words)
 
-                else:
-                    final_sequence.extend(new_sequence)
-                    final_words.extend(new_words)
-
-        # return self.decoding.tokenizer.decode(final_sequence)
         return final_words
 
 
