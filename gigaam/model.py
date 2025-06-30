@@ -255,7 +255,7 @@ class GigaAMASR(GigaAM):
         self,
         wav_file: str,
         chunk_len_sec: int = 20,
-        overlap_len_sec: int = 4,
+        stride_len_sec: int = 16,
         sample_rate: int = 16000,
         batch_size: int = 8,  # New parameter for batching
         **kwargs,
@@ -274,9 +274,7 @@ class GigaAMASR(GigaAM):
         """
         wav = load_audio(wav_file)
         chunk_samples = chunk_len_sec * sample_rate
-        overlap_samples = overlap_len_sec * sample_rate
-        step_samples = chunk_samples - overlap_samples
-        step_sec = step_samples / sample_rate
+        stride_samples = stride_len_sec * sample_rate
 
         # 1) Split audio into overlapping chunks
         chunks = []
@@ -284,10 +282,13 @@ class GigaAMASR(GigaAM):
         while start < len(wav):
             end = start + chunk_samples
             chunks.append(wav[start:end])
-            start += step_samples
+            start += stride_samples
 
         final_sequence = []
+        final_word_sequence = []
         final_words = []
+        end = ""
+        word_t_offset = 0
 
         # 2) Process chunks in batches
         for i in range(0, len(chunks), batch_size):
@@ -299,9 +300,10 @@ class GigaAMASR(GigaAM):
 
             # Pad all chunks in the batch to the same length
             padded_chunks = [
-                torch.nn.functional.pad(c, (0, max_len - len(c))) for c in batch_of_chunks
+                torch.nn.functional.pad(c, (0, max_len - len(c)))
+                for c in batch_of_chunks
             ]
-            
+
             wav_batch = torch.stack(padded_chunks).to(self._device).to(self._dtype)
             length_batch = torch.tensor(original_lengths, device=self._device)
 
@@ -313,80 +315,83 @@ class GigaAMASR(GigaAM):
             # The `res` dictionary contains lists of results for each item in the batch
             batch_sequences = res["ids"]
             batch_word_timestamps = res["word_timestamps"]
+            # for item in batch_sequences:
+            #     # print("begin", self.decoding.tokenizer.decode(item["begin_strided"]))
+            #     # print("non", self.decoding.tokenizer.decode(item["mid_strided"]))
+            #     # print("end", self.decoding.tokenizer.decode(item["end_strided"]))
+            #     # print()
+            #     end = self.decoding.tokenizer.decode(item["end_strided"])
 
-            for j in range(len(batch_of_chunks)):
-                # Get the result for the j-th chunk in the current batch
-                new_sequence = batch_sequences[j]
-                new_words = batch_word_timestamps[j]
-                global_chunk_idx = i + j
+            #     if not final_sequence:
+            #         final_sequence += self.decoding.tokenizer.decode(
+            #             item["begin_strided"]
+            #         ) + self.decoding.tokenizer.decode(item["mid_strided"])
+            #     else:
+            #         final_sequence += self.decoding.tokenizer.decode(
+            #             item["mid_strided"]
+            #         )
 
-                # Correct timestamps by adding the chunk's start time in the full audio
-                offset_sec = global_chunk_idx * step_sec
-                for word in new_words:
-                    word['start'] += offset_sec
-                    word['end'] += offset_sec
-                
-                # 5) Merge the tokens using the fault-tolerant algorithm
-                if not final_sequence:
-                    final_sequence = new_sequence
-                    final_words = new_words
+            for item in batch_word_timestamps:
+                # print(
+                #     "begin wt",
+                #     "".join([word["word"] for word in item["begin_strided"]]),
+                # )
+                # print("mid wt", "".join([word["word"] for word in item["mid_strided"]]))
+                # print("end wt", "".join([word["word"] for word in item["end_strided"]]))
+                # print()
+                stitched_last_word = False
+                if not final_words:
+                    final_words.extend(item["begin_strided"])
+                    final_words.extend(item["mid_strided"])
                 else:
-                    best_overlap_index = 0
-                    max_matching_score = 0.0
+                    if len(item['mid_strided']) == 0:
+                        word_t_offset += stride_len_sec
+                        continue
+                    if (
+                        final_words[-1]["word"][-1] != " "
+                        and item["mid_strided"][0]["word"][0] != " "
+                    ):
+                        print(final_words[-1]["word"], item["mid_strided"][0]["word"])
+                        final_words[-1] = {
+                            "word": final_words[-1]["word"]
+                            + item["mid_strided"][0]["word"],
+                            "token_ids": final_words[-1]["token_ids"]
+                            + item["mid_strided"][0]["token_ids"],
+                            "start": final_words[-1]["start"] + word_t_offset,
+                            "end": item["mid_strided"][0]["end"] + word_t_offset,
+                        }
+                        stitched_last_word = True
+                    for word in item["mid_strided"]:
+                        if stitched_last_word:
+                            stitched_last_word = False
+                            continue
+                        final_words.append(
+                            {
+                                "word": word["word"],
+                                "token_ids": word["token_ids"],
+                                "start": word["start"] + word_t_offset,
+                                "end": word["end"] + word_t_offset,
+                            }
+                        )
+                        # print(final_words)
+                    # final_words.extend(item["mid_strided"])
 
-                    # Check every possible overlap length `k`
-                    for k in range(1, min(len(final_sequence), len(new_sequence)) + 1):
-                        prev_suffix = final_sequence[-k:]
-                        new_prefix = new_sequence[:k]
+                word_t_offset += stride_len_sec
+                # print()
 
-                        matches = np.sum(np.array(prev_suffix) == np.array(new_prefix))
-                        epsilon = k / 10000.0
-                        matching_score = matches / k + epsilon
+        # final_sequence += end
+        for word in batch_word_timestamps[-1]["end_strided"]:
+            final_words.append(
+                {
+                    "word": word["word"],
+                    "token_ids": word["token_ids"],
+                    "start": word["start"] + word_t_offset,
+                    "end": word["end"] + word_t_offset,
+                }
+            )
 
-                        if matches > 1 and matching_score > max_matching_score:
-                            max_matching_score = matching_score
-                            best_overlap_index = k
-
-                    # Append the part of the new tokens that comes *after* the overlap
-                    final_sequence.extend(new_sequence[best_overlap_index:])
-
-                    if best_overlap_index > 0:
-                        # Find the first word in `new_words` that is not fully in the overlapped part
-                        tokens_processed = 0
-                        word_idx_to_start_from = 0
-                        
-                        for idx, word_data in enumerate(new_words):
-                            tokens_in_word = len(word_data["token_ids"])
-                            # If the overlap boundary is within this word
-                            if tokens_processed + tokens_in_word > best_overlap_index:
-                                word_idx_to_start_from = idx
-                                
-                                # Check if the split is exactly at the word boundary
-                                if tokens_processed == best_overlap_index:
-                                    # The split is clean, we start from this word
-                                    pass 
-                                else:
-                                    # The word is split. We need to trim the tokens from the beginning of it.
-                                    tokens_to_trim = best_overlap_index - tokens_processed
-                                    remaining_ids = word_data["token_ids"][tokens_to_trim:]
-                                    
-                                    if remaining_ids:
-                                        # Update the split word with remaining tokens and re-decoded text
-                                        new_words[idx]["token_ids"] = remaining_ids
-                                        new_words[idx]["word"] = self.decoding.tokenizer.decode(remaining_ids)
-                                    else:
-                                        # The word was fully consumed by the overlap, start from the next one
-                                        word_idx_to_start_from = idx + 1
-                                break
-                            
-                            tokens_processed += tokens_in_word
-                        
-                        if word_idx_to_start_from < len(new_words):
-                            final_words.extend(new_words[word_idx_to_start_from:])
-                    else:
-                        # No good overlap found, append everything
-                        final_words.extend(new_words)
-
+        # return final_words
+        # return "".join(final_sequence)
         return final_words
 
 
