@@ -115,7 +115,7 @@ class CTCGreedyDecoding:
                         if not word_begin_ms:
                             word_begin_ms = idx * 40
 
-                elif is_masked and idx > len(skip_mask[i]) - (STRIDE_N):
+                elif is_masked and idx >= len(skip_mask[i]) - (STRIDE_N):
                     if len(current_word_tokens) > 0 and not end_strided_ids:
                         word_end_ms = idx * 40
                         mid_strided_wt.append(

@@ -316,10 +316,10 @@ class GigaAMASR(GigaAM):
             batch_sequences = res["ids"]
             batch_word_timestamps = res["word_timestamps"]
             # for item in batch_sequences:
-            #     # print("begin", self.decoding.tokenizer.decode(item["begin_strided"]))
-            #     # print("non", self.decoding.tokenizer.decode(item["mid_strided"]))
-            #     # print("end", self.decoding.tokenizer.decode(item["end_strided"]))
-            #     # print()
+            #     print("begin", self.decoding.tokenizer.decode(item["begin_strided"]))
+            #     print("non", self.decoding.tokenizer.decode(item["mid_strided"]))
+            #     print("end", self.decoding.tokenizer.decode(item["end_strided"]))
+            #     print()
             #     end = self.decoding.tokenizer.decode(item["end_strided"])
 
             #     if not final_sequence:
@@ -351,7 +351,7 @@ class GigaAMASR(GigaAM):
                         final_words[-1]["word"][-1] != " "
                         and item["mid_strided"][0]["word"][0] != " "
                     ):
-                        print(final_words[-1]["word"], item["mid_strided"][0]["word"])
+                        # print(final_words[-1]["word"], item["mid_strided"][0]["word"])
                         final_words[-1] = {
                             "word": final_words[-1]["word"]
                             + item["mid_strided"][0]["word"],
@@ -379,7 +379,6 @@ class GigaAMASR(GigaAM):
                 word_t_offset += stride_len_sec
                 # print()
 
-        # final_sequence += end
         for word in batch_word_timestamps[-1]["end_strided"]:
             final_words.append(
                 {
@@ -390,7 +389,7 @@ class GigaAMASR(GigaAM):
                 }
             )
 
-        # return final_words
+        # final_sequence += end
         # return "".join(final_sequence)
         return final_words
 
