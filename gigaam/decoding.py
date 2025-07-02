@@ -51,6 +51,8 @@ class CTCGreedyDecoding:
         Decode the output of a CTC model into a list of hypotheses.
         """
         log_probs = head(encoder_output=encoded)
+
+        STRIDE_N = int(4 * 1000 / 40 / 2)
         assert (
             len(log_probs.shape) == 3
         ), f"Expected log_probs shape {log_probs.shape} == [B, T, C]"
@@ -77,55 +79,138 @@ class CTCGreedyDecoding:
         for length in lengths:
             skip_mask[length:] = 0
 
-        # for i in range(b):
-        #     pred_texts.append(
-        #         "".join(self.tokenizer.decode(labels[i][skip_mask[i]].cpu().tolist()))
-        #     )
-        # return pred_texts
-        # print('skip mask', skip_mask[0])
-        # pred_texts: List[str] = []
-        pred_ids: List[int] = []
+        pred_ids: List[dict] = []
         word_timestamps = []
-        current_word_tokens = []
-        word_begin_ms = -1
-        word_end_ms = 0
-        lbls = labels.cpu().tolist()
+
         for i in range(b):
+            begin_strided_ids: List[int] = []
+            mid_strided_ids: List[int] = []
+            end_strided_ids: List[int] = []
+            begin_strided_wt: List[dict] = []
+            mid_strided_wt: List[dict] = []
+            end_strided_wt: List[dict] = []
+            current_word_tokens = []
+            word_begin_ms = None
+            word_end_ms = None
+            current_labels = labels[i].cpu().tolist()
             for idx, is_masked in enumerate(skip_mask[i]):
-                if is_masked and lbls[i][idx] != 0:
-                    if word_begin_ms == -1:
-                        word_begin_ms = idx * 40
-                    current_word_tokens.append(lbls[i][idx])
-                    # print(lbls[i][idx], self.tokenizer.decode([lbls[i][idx]]))
-                    word_end_ms = idx * 40
-                elif is_masked and lbls[i][idx] == 0:
-                    word_timestamps.append(
-                        {
-                            "word": self.tokenizer.decode(current_word_tokens),
-                            "token_ids": current_word_tokens,
-                            "start": word_begin_ms / 1000,
-                            "end": word_end_ms / 1000,
-                        }
-                    )
-                    current_word_tokens = []
-                    word_begin_ms = -1
-            pred_ids.append(labels[i][skip_mask[i]].cpu().tolist())
-            # pred_texts.append(
-            #     "".join(self.tokenizer.decode(labels[i][skip_mask[i]].cpu().tolist()))
-            # )
-        if current_word_tokens:
-            word_timestamps.append(
+                if is_masked and idx <= STRIDE_N:
+                    begin_strided_ids.append(current_labels[idx])
+                    current_word_tokens.append(current_labels[idx])
+
+                    # if space
+                    if current_labels[idx] == 0:
+                        word_end_ms = idx * 40
+                        begin_strided_wt.append(
+                            {
+                                "word": self.tokenizer.decode(current_word_tokens),
+                                "token_ids": current_word_tokens,
+                                "start": word_begin_ms / 1000 if word_begin_ms else idx * 40,
+                                "end": word_end_ms / 1000,
+                            }
+                        )
+                        word_begin_ms = None
+                        current_word_tokens = []
+                    else:
+                        if not word_begin_ms:
+                            word_begin_ms = idx * 40
+
+                elif is_masked and idx >= len(skip_mask[i]) - (STRIDE_N):
+                    if len(current_word_tokens) > 0 and not end_strided_ids:
+                        word_end_ms = idx * 40
+                        mid_strided_wt.append(
+                            {
+                                "word": self.tokenizer.decode(current_word_tokens),
+                                "token_ids": current_word_tokens,
+                                "start": word_begin_ms / 1000 if word_begin_ms else idx * 40,
+                                "end": word_end_ms / 1000,
+                            }
+                        )
+                        word_begin_ms = None
+                        current_word_tokens = []
+
+                    end_strided_ids.append(current_labels[idx])
+                    current_word_tokens.append(current_labels[idx])
+                    # if space
+                    if current_labels[idx] == 0:
+                        word_end_ms = idx * 40
+                        end_strided_wt.append(
+                            {
+                                "word": self.tokenizer.decode(current_word_tokens),
+                                "token_ids": current_word_tokens,
+                                "start": word_begin_ms / 1000 if word_begin_ms else idx * 40,
+                                "end": word_end_ms / 1000,
+                            }
+                        )
+                        word_begin_ms = None
+                        current_word_tokens = []
+                    else:
+                        if not word_begin_ms:
+                            word_begin_ms = idx * 40
+                elif is_masked:
+                    if len(current_word_tokens) > 0 and not mid_strided_ids:
+                        word_end_ms = idx * 40
+                        begin_strided_wt.append(
+                            {
+                                "word": self.tokenizer.decode(current_word_tokens),
+                                "token_ids": current_word_tokens,
+                                "start": word_begin_ms / 1000 if word_begin_ms else idx * 40,
+                                "end": word_end_ms / 1000,
+                            }
+                        )
+                        word_begin_ms = None
+                        current_word_tokens = []
+                        
+                    current_word_tokens.append(current_labels[idx])
+                    mid_strided_ids.append(current_labels[idx])
+
+                    # if space or end of stride
+                    if current_labels[idx] == 0:
+                        word_end_ms = idx * 40
+                        mid_strided_wt.append(
+                            {
+                                "word": self.tokenizer.decode(current_word_tokens),
+                                "token_ids": current_word_tokens,
+                                "start": word_begin_ms / 1000 if word_begin_ms else idx * 40,
+                                "end": word_end_ms / 1000,
+                            }
+                        )
+                        word_begin_ms = None
+                        current_word_tokens = []
+                    else:
+                        if not word_begin_ms:
+                            word_begin_ms = idx * 40
+            if current_word_tokens:
+                word_end_ms = idx * 40
+                end_strided_wt.append(
+                    {
+                        "word": self.tokenizer.decode(current_word_tokens),
+                        "token_ids": current_word_tokens,
+                        "start": word_begin_ms / 1000 if word_begin_ms else idx * 40,
+                        "end": word_end_ms / 1000,
+                    }
+                )
+                word_begin_ms = None
+                current_word_tokens = []
+            pred_ids.append(
                 {
-                    "word": self.tokenizer.decode(current_word_tokens),
-                    "token_ids": current_word_tokens,
-                    "start": word_begin_ms / 1000,
-                    "end": word_end_ms / 1000,
+                    "mid_strided": mid_strided_ids,
+                    "begin_strided": begin_strided_ids,
+                    "end_strided": end_strided_ids,
                 }
             )
+
+            word_timestamps.append(
+                {
+                    "mid_strided": mid_strided_wt,
+                    "begin_strided": begin_strided_wt,
+                    "end_strided": end_strided_wt,
+                }
+            )
+
         return {
-            # "text": pred_texts,
             "ids": pred_ids,
-            "word_timestamps": word_timestamps
+            "word_timestamps": word_timestamps,
         }
 
 

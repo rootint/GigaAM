@@ -13,69 +13,6 @@ import numpy as np
 LONGFORM_THRESHOLD = 25 * SAMPLE_RATE
 
 
-def _merge_word_timestamps(
-    prev_words: List[Dict[str, Any]], new_words: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Merges two lists of word timestamp dictionaries using a fault-tolerant
-    comparison of their underlying token IDs.
-
-    It finds the longest sequence of words at the end of `prev_words` that
-    best matches a sequence at the beginning of `new_words`.
-    """
-    if not prev_words:
-        return new_words
-    if not new_words:
-        return prev_words
-
-    # We'll compare based on the sequence of token IDs for each word
-    prev_word_tokens = [word["token_ids"] for word in prev_words]
-    new_word_tokens = [word["token_ids"] for word in new_words]
-
-    best_overlap_n_words = 0
-    max_matching_score = 0.0
-
-    # Iterate through possible overlap lengths (in number of words)
-    for k in range(1, min(len(prev_word_tokens), len(new_word_tokens)) + 1):
-        # The last k words of the previous sequence
-        prev_suffix = prev_word_tokens[-k:]
-        # The first k words of the new sequence
-        new_prefix = new_word_tokens[:k]
-
-        # To compare them fault-tolerantly, flatten the token IDs in the overlap
-        flat_prev = [tok for word in prev_suffix for tok in word]
-        flat_new = [tok for word in new_prefix for tok in word]
-
-        # We can't guarantee the flattened lists are the same length
-        # if the model tokenized slightly differently (e.g., "the" vs "thee").
-        # So, we compare the shorter of the two.
-        compare_len = min(len(flat_prev), len(flat_new))
-        if compare_len == 0:
-            continue
-
-        matches = np.sum(
-            np.array(flat_prev[:compare_len]) == np.array(flat_new[:compare_len])
-        )
-
-        # Scoring logic: ratio of matched tokens.
-        # Add a small epsilon proportional to the number of words to favor longer word overlaps.
-        matching_score = matches / compare_len + (k / 1000.0)
-
-        if matching_score > max_matching_score:
-            max_matching_score = matching_score
-            best_overlap_n_words = k
-
-    # If the best match is very poor, it's safer to not merge.
-    # A threshold of 0.5 means at least half the tokens in the overlap should match.
-    if max_matching_score < 0.5:
-        best_overlap_n_words = 0
-
-    # The final merged list is the previous list plus the non-overlapping part of the new one.
-    merged = prev_words + new_words[best_overlap_n_words:]
-
-    return merged
-
-
 class GigaAM(nn.Module):
     """
     Giga Acoustic Model: Self-Supervised Model for Speech Tasks
@@ -238,71 +175,223 @@ class GigaAMASR(GigaAM):
         return transcribed_segments
 
     ### --- CUSTOM IMPLEMENTATION --- ###
+    # @torch.inference_mode()
+    # def transcribe_longform_overlap(
+    #     self,
+    #     wav_file: str,
+    #     chunk_len_sec: int = 20,
+    #     overlap_len_sec: int = 4,
+    #     sample_rate: int = 16000,
+    #     **kwargs,
+    # ):
+    #     """
+    #     Implements the full long-form transcription pipeline using a
+    #     fault-tolerant merging strategy inspired by Hugging Face's implementation.
+    #     """
+    #     wav = load_audio(wav_file)
+    #     chunk_samples = chunk_len_sec * sample_rate
+    #     overlap_samples = overlap_len_sec * sample_rate
+    #     step_samples = chunk_samples - overlap_samples
+
+    #     chunks = []
+    #     start = 0
+    #     while start < len(wav):
+    #         end = start + chunk_samples
+    #         chunks.append(wav[start:end])
+    #         start += step_samples
+
+    #     final_sequence = []
+
+    #     for i, chunk in enumerate(chunks):
+    #         wav_chunk = chunk.to(self._device).to(self._dtype).unsqueeze(0)
+    #         length = torch.full([1], wav_chunk.shape[-1], device=self._device)
+    #         encoded, encoded_len = self.forward(wav_chunk, length)
+
+    #         # Get the structured result from the decoder
+    #         res = self.decoding.decode(self.head, encoded, encoded_len)
+
+    #         new_sequence = res['ids'][0]
+    #         new_words = res['word_timestamps']
+
+    #         # 5) Merge the tokens using the fault-tolerant algorithm
+    #         if not final_sequence:
+    #             final_sequence = new_sequence
+    #         else:
+    #             # This block implements the Hugging Face merge logic
+    #             best_overlap_index = 0
+    #             max_matching_score = 0.0
+
+    #             # We check every possible overlap length `k`
+    #             for k in range(1, min(len(final_sequence), len(new_sequence)) + 1):
+    #                 # Suffix of the previous sequence
+    #                 prev_suffix = final_sequence[-k:]
+    #                 # Prefix of the new sequence
+    #                 new_prefix = new_sequence[:k]
+
+    #                 # Count how many tokens match
+    #                 matches = np.sum(np.array(prev_suffix) == np.array(new_prefix))
+
+    #                 # Calculate the matching score with an epsilon for tie-breaking
+    #                 epsilon = k / 10000.0
+    #                 matching_score = matches / k + epsilon
+
+    #                 # If this is the best score so far, store it
+    #                 # We add `matches > 1` as a heuristic to avoid spurious single-token matches
+    #                 if matches > 1 and matching_score > max_matching_score:
+    #                     max_matching_score = matching_score
+    #                     best_overlap_index = k
+
+    #             if best_overlap_index > 0:
+    #                 # Append the part of the new tokens that comes *after* the overlap
+    #                 final_sequence.extend(new_sequence[best_overlap_index:])
+    #             else:
+    #                 # print("No significant overlap found. Appending all new tokens.")
+    #                 final_sequence.extend(new_sequence)
+
+    #     return self.decoding.tokenizer.decode(final_sequence)
 
     @torch.inference_mode()
     def transcribe_longform_overlap(
         self,
         wav_file: str,
         chunk_len_sec: int = 20,
-        overlap_len_sec: int = 4,
+        stride_len_sec: int = 16,
         sample_rate: int = 16000,
+        batch_size: int = 8,  # New parameter for batching
         **kwargs,
     ):
         """
-            Transcribes a long audio file by splitting it into overlapping chunks,
-            then intelligently merging the resulting word timestamp lists.
+        Implements the full long-form transcription pipeline using a
+        fault-tolerant merging strategy with batched inference.
+
+        Args:
+            wav_file (str): Path to the audio file.
+            chunk_len_sec (int): Length of each audio chunk in seconds.
+            overlap_len_sec (int): Length of the overlap between consecutive chunks in seconds.
+            sample_rate (int): The sample rate of the audio.
+            batch_size (int): Number of chunks to process simultaneously.
+            **kwargs: Additional arguments.
         """
-        # This part remains the same
         wav = load_audio(wav_file)
         chunk_samples = chunk_len_sec * sample_rate
-        overlap_samples = overlap_len_sec * sample_rate
-        step_samples = chunk_samples - overlap_samples
+        stride_samples = stride_len_sec * sample_rate
 
+        # 1) Split audio into overlapping chunks
         chunks = []
         start = 0
         while start < len(wav):
             end = start + chunk_samples
             chunks.append(wav[start:end])
-            start += step_samples
+            start += stride_samples
 
-        # CHANGE: We will store the final list of word dictionaries here.
-        final_word_timestamps = []
+        final_sequence = []
+        final_word_sequence = []
+        final_words = []
+        end = ""
+        word_t_offset = 0
 
-        for i, chunk in enumerate(chunks):
-            # Audio processing remains the same
-            wav_chunk = chunk.to(self._device).to(self._dtype).unsqueeze(0)
-            length = torch.full([1], wav_chunk.shape[-1], device=self._device)
-            encoded, encoded_len = self.forward(wav_chunk, length)
+        # 2) Process chunks in batches
+        for i in range(0, len(chunks), batch_size):
+            batch_of_chunks = chunks[i : i + batch_size]
 
-            # Get the structured result from the decoder
+            # --- Create batch tensors for the model ---
+            original_lengths = [len(c) for c in batch_of_chunks]
+            max_len = max(original_lengths)
+
+            # Pad all chunks in the batch to the same length
+            padded_chunks = [
+                torch.nn.functional.pad(c, (0, max_len - len(c)))
+                for c in batch_of_chunks
+            ]
+
+            wav_batch = torch.stack(padded_chunks).to(self._device).to(self._dtype)
+            length_batch = torch.tensor(original_lengths, device=self._device)
+
+            # --- Perform batched inference ---
+            encoded, encoded_len = self.forward(wav_batch, length_batch)
             res = self.decoding.decode(self.head, encoded, encoded_len)
-            
-            # We work with the word_timestamps list now
-            new_words = res['word_timestamps'] # Assuming decode returns a batch
 
-            # --- KEY CHANGE 1: Timestamp Correction ---
-            # Calculate the time offset of the current chunk in seconds.
-            time_offset_sec = (i * step_samples) / sample_rate
-            
-            # Apply the offset to make timestamps absolute.
-            for word in new_words:
-                word['start'] += time_offset_sec
-                word['end'] += time_offset_sec
-                # Round for cleaner output, optional
-                word['start'] = round(word['start'], 2)
-                word['end'] = round(word['end'], 2)
+            # --- De-batch results and stitch them sequentially ---
+            # The `res` dictionary contains lists of results for each item in the batch
+            batch_sequences = res["ids"]
+            batch_word_timestamps = res["word_timestamps"]
+            # for item in batch_sequences:
+            #     print("begin", self.decoding.tokenizer.decode(item["begin_strided"]))
+            #     print("non", self.decoding.tokenizer.decode(item["mid_strided"]))
+            #     print("end", self.decoding.tokenizer.decode(item["end_strided"]))
+            #     print()
+            #     end = self.decoding.tokenizer.decode(item["end_strided"])
 
-            print(f"--- Chunk {i+1}: Found {len(new_words)} words (time offset: {time_offset_sec:.2f}s) ---")
-            # For debugging, you can print the words from this chunk:
-            # print([w['word'] for w in new_words])
+            #     if not final_sequence:
+            #         final_sequence += self.decoding.tokenizer.decode(
+            #             item["begin_strided"]
+            #         ) + self.decoding.tokenizer.decode(item["mid_strided"])
+            #     else:
+            #         final_sequence += self.decoding.tokenizer.decode(
+            #             item["mid_strided"]
+            #         )
 
-            # --- KEY CHANGE 2: Merging Word Lists ---
-            # Use our new helper function to merge the word lists.
-            final_word_timestamps = _merge_word_timestamps(final_word_timestamps, new_words)
+            for item in batch_word_timestamps:
+                # print(
+                #     "begin wt",
+                #     "".join([word["word"] for word in item["begin_strided"]]),
+                # )
+                # print("mid wt", "".join([word["word"] for word in item["mid_strided"]]))
+                # print("end wt", "".join([word["word"] for word in item["end_strided"]]))
+                # print()
+                stitched_last_word = False
+                if not final_words:
+                    final_words.extend(item["begin_strided"])
+                    final_words.extend(item["mid_strided"])
+                else:
+                    if len(item['mid_strided']) == 0:
+                        word_t_offset += stride_len_sec
+                        continue
+                    if (
+                        final_words[-1]["word"][-1] != " "
+                        and item["mid_strided"][0]["word"][0] != " "
+                    ):
+                        # print(final_words[-1]["word"], item["mid_strided"][0]["word"])
+                        final_words[-1] = {
+                            "word": final_words[-1]["word"]
+                            + item["mid_strided"][0]["word"],
+                            "token_ids": final_words[-1]["token_ids"]
+                            + item["mid_strided"][0]["token_ids"],
+                            "start": final_words[-1]["start"] + word_t_offset,
+                            "end": item["mid_strided"][0]["end"] + word_t_offset,
+                        }
+                        stitched_last_word = True
+                    for word in item["mid_strided"]:
+                        if stitched_last_word:
+                            stitched_last_word = False
+                            continue
+                        final_words.append(
+                            {
+                                "word": word["word"],
+                                "token_ids": word["token_ids"],
+                                "start": word["start"] + word_t_offset,
+                                "end": word["end"] + word_t_offset,
+                            }
+                        )
+                        # print(final_words)
+                    # final_words.extend(item["mid_strided"])
 
-        # The final result is the merged list of word dictionaries.
-        # You can return this directly or format it as a string.
-        return final_word_timestamps
+                word_t_offset += stride_len_sec
+                # print()
+
+        for word in batch_word_timestamps[-1]["end_strided"]:
+            final_words.append(
+                {
+                    "word": word["word"],
+                    "token_ids": word["token_ids"],
+                    "start": word["start"] + word_t_offset,
+                    "end": word["end"] + word_t_offset,
+                }
+            )
+
+        # final_sequence += end
+        # return "".join(final_sequence)
+        return final_words
 
 
 class GigaAMEmo(GigaAM):
